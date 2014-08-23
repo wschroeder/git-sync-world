@@ -1,0 +1,6 @@
+Makefile.PL
+MANIFEST
+README
+t/linux.t
+t/windows.t
+bin/git-sync-world

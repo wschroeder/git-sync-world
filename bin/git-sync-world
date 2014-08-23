@@ -1,0 +1,799 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use IO::File;
+use IPC::Open3 qw(open3);
+use Getopt::Long;
+use Pod::Usage;
+
+sub status {
+    my $message = shift;
+    print STDOUT "git-sync-world: $message\n";
+}
+
+sub nonfatal_error {
+    my $message = shift;
+    status("ERROR - $message");
+}
+
+sub fatal_error {
+    nonfatal_error(@_);
+    exit(1);
+}
+
+sub quiet_system {
+    my ($stdin, $stdout, $stderr);
+    waitpid open3($stdin, $stdout, $stderr, @_), 0;
+    return $?;
+}
+
+sub get_command_mode {
+    my %mode;
+    GetOptions(
+        '--help|?'   => sub { pod2usage(-verbose => 2, -exitval => 0) },
+        '--status'   => \$mode{status},
+        '--abort'    => \$mode{abort},
+        '--continue' => \$mode{continue},
+        '--skip'     => \$mode{skip},
+    ) || pod2usage(-verbose => 1, -exitval => 2);
+
+    for my $command (keys %mode) {
+        if (!defined($mode{$command})) {
+            delete $mode{$command};
+        }
+    }
+
+    if (scalar(values %mode) > 1) {
+        fatal_error("Can only support one command at a time.");
+    }
+
+    my ($final_mode) = keys %mode;
+
+    return $final_mode || 'sync';
+}
+
+sub get_root_git_dir {
+    my $root_dir = `git rev-parse --show-toplevel`;
+    if (!defined($root_dir) || $root_dir eq '') {
+        fatal_error('Cannot find the git root directory from here');
+    }
+    chomp($root_dir);
+    return $root_dir;
+}
+
+sub get_configuration {
+    my $root_dir  = get_root_git_dir();
+    my $user_home = "$root_dir/git-sync-world";
+    check_for_dirty_working_tree();
+    return (
+        user_home => $user_home,
+        sync_home => "$root_dir/.git/git-sync-world",
+        world_id  => get_current_world_change_id($user_home),
+        local_id  => get_current_git_id(),
+    );
+}
+
+sub check_for_dirty_working_tree {
+    if (system(qw(git diff-index --quiet HEAD --))) {
+        fatal_error("Cannot run in a git repo with a dirty working tree.\nIf you are trying to test, you probably should not modify the world anyway.");
+    }
+}
+
+sub get_current_world_change_id {
+    my $user_home = shift;
+
+    if (! -d $user_home) {
+        fatal_error("Expected to find a $user_home directory");
+    }
+
+    if (! -x "$user_home/get-change-id") {
+        fatal_error("Expected to find an executable $user_home/get-change-id");
+    }
+
+    my $current_world_change_id = `$user_home/get-change-id`;
+    if ($? || !defined($current_world_change_id)) {
+        fatal_error("$user_home/get-change-id exited with an error");
+    }
+
+    chomp($current_world_change_id);
+    if ($current_world_change_id eq 'HEAD' || quiet_system("git rev-parse $current_world_change_id")) {
+        fatal_error("$user_home/get-change-id should return a git revision or nothing (to indicate first change)");
+    }
+
+    return $current_world_change_id;
+}
+
+sub get_current_git_id {
+    my $current_git_id = `git rev-parse HEAD`;
+    chomp($current_git_id);
+    return $current_git_id;
+}
+
+sub save_git_id {
+    my $sync_home = shift;
+
+    my $friendly_id = `git rev-parse --abbrev-ref HEAD`;
+    if ($friendly_id eq "HEAD\n") {
+        $friendly_id = get_current_git_id() . "\n";
+    }
+
+    my $fh;
+    open($fh, ">", "$sync_home/ORIG_HEAD") || fatal_error("Unable to save the original HEAD for this session.");
+    $fh->print($friendly_id) || fatal_error("Unable to save the original HEAD for this session.");
+    $fh->close();
+}
+
+sub load_git_id {
+    my $sync_home = shift;
+    my $fh;
+    open($fh, "<", "$sync_home/ORIG_HEAD") || fatal_error("Unable to load the original HEAD for this session.");
+    my $id = <$fh> || fatal_error("Unable to load the original HEAD for this session.");
+    $fh->close();
+    chomp($id);
+    return $id;
+}
+
+sub pop_revision {
+    my $revision_file = shift;
+
+    return undef if (! -e $revision_file);
+
+    my $fh;
+    open($fh, "<", $revision_file) || fatal_error("Unable to load $revision_file");
+    my @revisions = <$fh>;
+    $fh->close();
+
+    my $id = shift @revisions;
+
+    if ($id) {
+        chomp($id);
+
+        my $fh;
+        open($fh, ">", $revision_file) || fatal_error("Unable to save $revision_file");
+        $fh->print(@revisions) || fatal_error("Unable to save $revision_file");
+        $fh->close();
+    }
+
+    return $id;
+}
+
+sub push_revision {
+    my ($revision_file, $id) = @_;
+
+    my @revisions;
+    my $fh;
+
+    if (-e $revision_file) {
+        open($fh, "<", $revision_file) || fatal_error("Unable to load $revision_file");
+        @revisions = <$fh>;
+        $fh->close();
+    }
+
+    open($fh, ">", $revision_file) || fatal_error("Unable to save $revision_file");
+    $fh->print("$id\n", @revisions) || fatal_error("Unable to save $revision_file");
+    $fh->close();
+}
+
+sub checkout {
+    my $revision = shift;
+    if (quiet_system("git checkout $revision")) {
+        nonfatal_error("Cannot checkout $revision");
+        return;
+    }
+    return 1;
+}
+
+sub is_initial_git_commit {
+    return quiet_system("git rev-parse HEAD^") ? 1 : undef;
+}
+
+sub at_least_one_change_file_exists {
+    my $user_home = shift;
+    return (-e "$user_home/commit" || -e "$user_home/verify-commit" || -e "$user_home/rollback" || -e "$user_home/verify-rollback");
+}
+
+sub all_change_files_exist_and_are_executable {
+    my $user_home = shift;
+
+    for my $control_file (qw( commit set-change-id verify-commit rollback verify-rollback )) {
+        if (! -x "$user_home/$control_file") {
+            status("Expected to find an executable $user_home/$control_file");
+            return;
+        }
+    }
+
+    return 1;
+}
+
+sub set_change_id {
+    my ($user_home, $change_id) = @_;
+    if (system("$user_home/set-change-id", $change_id)) {
+        nonfatal_error("set-change-id failed at $change_id\nThe state of the system may be dirty, since commit succeeded.");
+        return;
+    }
+    return 1;
+}
+
+sub apply_commit {
+    my ($user_home, $current_git_id) = @_;
+
+    if (!at_least_one_change_file_exists($user_home)) {
+        status("Nothing to do at ${current_git_id}.");
+        return 1;
+    }
+
+    if (!all_change_files_exist_and_are_executable($user_home)) {
+        return;
+    }
+
+    if (system("$user_home/commit")) {
+        nonfatal_error("commit failed at $current_git_id\nThe state of the system may be dirty.");
+        return;
+    }
+
+    if (!set_change_id($user_home, get_current_git_id())) {
+        return;
+    }
+
+    if (system("$user_home/verify-commit")) {
+        my $current_world_change_id = get_current_world_change_id($user_home);
+        if ($current_world_change_id ne '') {
+            nonfatal_error("verify-commit failed at $current_git_id\nDon't forget to rollback your version to\n\n    $current_world_change_id\n\n\ninstead of\n\n    $current_git_id\n\n\nThe state of the system may be dirty.");
+            return;
+        }
+        else {
+            nonfatal_error("verify-commit failed at $current_git_id\nThe state of the system may be dirty.");
+            return;
+        }
+    }
+
+    status("Applied commit at $current_git_id");
+    return 1;
+}
+
+sub apply_rollback {
+    my ($user_home, $current_git_id) = @_;
+
+    if (!at_least_one_change_file_exists($user_home)) {
+        status("Nothing to do at ${current_git_id}.");
+        return 1;
+    }
+
+    if (!all_change_files_exist_and_are_executable($user_home)) {
+        return;
+    }
+
+    if (system("$user_home/rollback")) {
+        nonfatal_error("rollback failed at $current_git_id\nThe state of the system may be dirty.");
+        return;
+    }
+
+    if (system("$user_home/verify-rollback")) {
+        nonfatal_error("verify-rollback failed at $current_git_id\nThe state of the system may be dirty.");
+        return;
+    }
+
+    if (is_initial_git_commit()) {
+        if (system("$user_home/set-change-id", '')) {
+            nonfatal_error("set-change-id failed at $current_git_id\nThe state of the system may be dirty, since rollback succeeded.");
+            return;
+        }
+        return 1;
+    }
+    elsif (!checkout('HEAD^')) {
+        return 1;
+    }
+
+    if (!set_change_id($user_home, get_current_git_id())) {  # This is prior to $current_git_id
+        return;
+    }
+
+    status("Applied rollback at $current_git_id");
+    return 1;
+}
+
+sub apply_revision_changes {
+    my ($user_home, $change_type, $current_git_id) = @_;
+    return $change_type eq 'rollback' ? apply_rollback($user_home, $current_git_id) :
+                                        apply_commit($user_home, $current_git_id);
+}
+
+sub finish_session {
+    my ($sync_home, $original_git_id) = @_;
+    if (!checkout($original_git_id)) {
+        fatal_error("Could not find ORIG_HEAD of $original_git_id");
+    }
+
+    unlink map {"$sync_home/$_"} qw(ORIG_HEAD rollback commit);
+    rmdir $sync_home;
+
+    status("Done.");
+    exit(0);
+}
+
+sub is_mid_sync {
+    my %config = @_;
+    return -d $config{sync_home};
+}
+
+sub exit_if_world_synced {
+    my %config = @_;
+    if ($config{world_id} eq $config{local_id}) {
+        status('Nothing to do.  The world is already synced.');
+        exit(0);
+    }
+}
+
+sub exit_if_is_not_mid_sync {
+    my ($command, %config) = @_;
+    if (!is_mid_sync(%config)) {
+        fatal_error("Unable to $command because we are not in the middle of a sync-world session.");
+    }
+}
+
+sub apply_changes_from_files {
+    my %config = @_;
+
+    for my $change_type (qw( rollback commit )) {
+        while (my $current_revision = pop_revision("$config{sync_home}/$change_type")) {
+            if (!checkout($current_revision) || !apply_revision_changes($config{user_home}, $change_type, $current_revision)) {
+                push_revision("$config{sync_home}/$change_type", $current_revision);
+                exit(1);
+            }
+        }
+    }
+
+    finish_session($config{sync_home}, load_git_id($config{sync_home}));
+}
+
+# -----------------------------------------------------------------------------
+# Commands
+# -----------------------------------------------------------------------------
+sub command_status {
+    my %config = get_configuration();
+
+    status("World ID: $config{world_id}");
+    status("Git ID  : $config{local_id}");
+
+    if (is_mid_sync(%config)) {
+        status("We are in the middle of a sync.");
+        status("To continue syncing, use the --continue command.");
+        status("To abort, use the --abort command.");
+        status("To skip this revision, use the --skip command.");
+    }
+    else {
+        exit_if_world_synced(%config);
+        status('The world will be synced to your git repository.');
+    }
+
+    exit(0);
+}
+
+sub command_sync {
+    my %config = get_configuration();
+    exit_if_world_synced(%config);
+    if (is_mid_sync(%config)) {
+        fatal_error("We are in the middle of a sync-world session; --continue, --skip, or --abort?");
+    }
+
+    my $sync_home = $config{sync_home};
+    mkdir "$sync_home";
+    save_git_id($sync_home);
+
+    # Build sync-world instructions, rollbacks followed by commits
+    if ($config{world_id} eq '') {
+        if (system("git log --format='%H' --reverse > $sync_home/commit")) {
+            fatal_error("Unable to create commit instructions.");
+        }
+    }
+    else {
+        if (system("git rev-list HEAD..$config{world_id} > $sync_home/rollback")) {
+            fatal_error("Unable to create rollback instructions.");
+        }
+        if (system("git rev-list --reverse $config{world_id}..HEAD > $sync_home/commit")) {
+            fatal_error("Unable to create commit instructions.");
+        }
+    }
+
+    apply_changes_from_files(%config);
+}
+
+sub command_continue {
+    my %config = get_configuration();
+    exit_if_world_synced(%config);
+    exit_if_is_not_mid_sync('continue', %config);
+    status('Continuing sync-world...');
+    apply_changes_from_files(%config);
+}
+
+sub command_skip {
+    my %config = get_configuration();
+    exit_if_world_synced(%config);
+    exit_if_is_not_mid_sync('skip', %config);
+    status('Skipping this revision...');
+    if (!pop_revision("$config{sync_home}/rollback") && !pop_revision("$config{sync_home}/commit")) {
+        finish_session($config{sync_home}, load_git_id($config{sync_home}));
+    }
+    apply_changes_from_files(%config);
+}
+
+sub command_abort {
+    my %config = get_configuration();
+    exit_if_world_synced(%config);
+    exit_if_is_not_mid_sync('abort', %config);
+    status('Aborting sync-world...');
+    finish_session($config{sync_home}, load_git_id($config{sync_home}));
+}
+
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+{
+    status   => \&command_status,
+    sync     => \&command_sync,
+    continue => \&command_continue,
+    skip     => \&command_skip,
+    abort    => \&command_abort,
+}->{&get_command_mode}->();
+
+
+__END__
+
+=head1 NAME
+
+git-sync-world - Sync the world to this git checkout
+
+=head1 SYNOPSIS
+
+git sync-world
+
+git sync-world --status
+
+git sync-world [--continue|--skip|--abort]
+
+=head1 DESCRIPTION
+
+Synchronizes the world to this git checkout.
+
+It rolls back changes down the git revision tree and commits changes up the
+git revision tree in the shortest path in order to migrate world changes from
+git version the world uses to the git version checked out.  For example, this
+can be used to perform schema migrations, including rollbacks, updates, and
+testing of feature branches.
+
+At each revision, it looks in the root of the git repository for the
+C<git-sync-world> directory, which must have executable C<get-change-id>,
+C<commit>, C<verify-commit>, C<set-change-id>, C<rollback>, and
+C<verify-rollback> files, representing the stages of the synchronization
+workflow.  See the L</"WORKFLOW"> and L</"CHANGE FILES"> sections for more
+information about these files.
+
+=head1 OPTIONS
+
+=over
+
+=item --abort
+
+Similar to L<"git-rebase"> behavior, if the git repository is in the middle of
+a sync-world operation that experienced a failure, this option will abort
+synchronization and return the git repository to the original checkout.
+
+=item --continue
+
+Similar to L<"git-rebase"> behavior, if the git repository is in the middle of
+a sync-world operation that experienced a failure, this option will continue
+the workflow where it left off, starting with rollback or commit.  Note that
+you will likely be changing the revision ID at this point in order to fix the
+system, so you must also update C<.git/git-sync-world/commit> or
+C<.git/git-sync-world/rollback> to replace the bad revision ID and subsequent
+IDs with the new good branch of revision IDs, likely starting with the current
+HEAD.
+
+=item --help
+
+Show this help.
+
+=item --skip
+
+Similar to L<"git-rebase"> behavior, if the git repository is in the middle of
+a sync-world operation that experienced a failure, this option will skip the
+current revision, checkout the next revision, and continue the workflow where
+it left off, starting with rollback or commit.
+
+=item --status
+
+Show the current status of the world contrasted with the current git checkout.
+
+=back
+
+=head1 WORKFLOW
+
+Assume the following git history exists, the current branch is C<topic>, and
+the change ID in the world matches C<master>:
+
+          A---B---C topic
+         /
+    D---E---F---G master
+
+
+When you run C<git-sync-world>, it will first determine what needs to be done,
+comparing the current HEAD against C<git-sync-world/get-change-id>, which
+should return the C<master> revision in this scenario.
+
+It records the current friendly revision in C<.git/git-sync-world/ORIG_HEAD>
+(C<topic>).  It figures out that in order to reach the C<topic> branch from
+C<master>, it must roll back changes in G, then F, then E; these three
+revisions are recorded in C<.git/git-sync-world/rollback>.  Then it figures
+out that to crawl back up the tree to C<topic>, it must commit changes in A,
+then B, then C; these three revisions are recorded in
+C<.git/git-sync-world/commit>.
+
+It cycles through all the revisions in the C<.git/git-sync-world/rollback>
+file by removing the first entry from the file at each checkout.  It will then
+checkout the revision, call C<git-sync-world/rollback>, call
+C<git-sync-world/verify-rollback>, checkout the prior revision (C<HEAD^>), and
+call C<git-sync-world/set-change-id>.  It repeats this for G, F, and E.
+
+When there are no revisions in C<.git/git-sync-world/rollback>, it cycles
+through all the revisions in the C<.git/git-sync-world/commit> file by
+removing the first entry from the file at each checkout.  It will then
+checkout the revision, call C<git-sync-world/commit>, call
+C<git-sync-world/set-change-id>, and call C<git-sync-world/verify-commit>.  It
+repeats this for A, B, and C.
+
+Finally, it checks out the C<.git/git-sync-world/ORIG_HEAD>, which in this
+scenario was C<topic>.
+
+If the process fails at any point, it will not attempt recovery.  No magic.
+This allows you to debug and correct problems at the exact point of failure.
+
+Note that every step of the process is in a detached HEAD state.  If it
+started with a detached HEAD, it will end with that same revision, detached;
+otherwise, it will checkout the branch appropriately.
+
+
+=head1 CHANGE FILES
+
+For each revision or migration, you must define all six change files.
+Usually, C<get-change-id> and C<set-change-id> only need to be established
+once in the first commit, and C<commit>, C<verify-commit>, C<rollback>, and
+C<verify-rollback> are updated for every new change to the world.  In most
+cases, C<verify-rollback> can be written as the inverse of C<verify-commit>,
+saving you the need to change it at each commit as well.
+
+=over
+
+=item commit
+
+This script applies changes to the world.  For example, you might implement
+C<commit> as a Python script that uses SQLAlchemy to add a column to a table
+in a database.  A nonzero exit status is considered a failure to apply
+changes.
+
+=item get-change-id
+
+This script prints to C<STDOUT> the unique git revision hash.  For example,
+you might implement C<get-change-id> as a Perl script that uses DBI to query a
+table in a database for its schema revision ID and then print it.  An empty
+string (no output) indicates the pre-tracking state; no changes have been
+officially committed to the data source.  It probably only needs to be
+implemented once.  A nonzero exit status is considered a failure to retrieve
+the ID.
+
+=item rollback
+
+This script applies changes to the world that reverse changes made by the
+C<commit> in the same revision.  For example, you might implement C<rollback>
+as a Ruby script that uses Sequel to remove a column from a table in a
+database.  Not all kinds of changes are easy to rollback, such as data
+transforms; this bad situation occurs whenever recorded strings contain more
+than one kind of information, effectively violating First Normal Form.  A
+nonzero exit status is considered a failure to apply changes.
+
+=item set-change-id
+
+This script takes a single argument, a git revision hash, and marks the world
+with this ID.  For example, you might implement C<set-change-id> as
+gcc-compiled binary that sets this value to a table in a database to represent
+the schema revision ID.  It probably only needs to be implemented once.  A
+nonzero exit status is considered a failure to set the ID.
+
+=item verify-commit
+
+This script tests that the recent C<commit> actually made the expected
+changes.  For example, if C<commit> inserted rows into a domain table in a
+database, C<verify-commit> could be a C<sh> script that runs the C<mysql>
+client to perform a query for those rows.  A nonzero exit status indicates
+that the C<commit> failed to pass the tests, and a zero exit status indicates
+a pass.
+
+=item verify-rollback
+
+This script tests that the recent C<rollback> actually made the expected
+changes that revert what was done by the C<commit> in the same revision.  For
+example, if C<commit> inserted rows into a domain table in a database and
+C<rollback> removed those rows, C<verify-rollback> could be a C<bash> script
+that runs C<sqlplus> to perform a query that shows that those rows no longer
+exist.  It probably only needs to be implemented once as the inverse of the
+result of a call to C<verify-commit>, but some kinds of changes need extra
+checking.  A nonzero exit status indicates that the C<rollback> failed to pass
+the tests, and a zero exit status indicates a pass.
+
+=back
+
+=head1 MOTIVATION
+
+C<git-sync-world> was inspired by C<Sqitch> by theory (sqitch.org).  At the
+time of writing, it differs in that it adds a verify phase for rollbacks, uses
+git revisions for change tracking rather than a database of dependencies, and
+has fewer opinions in terms of how changes should be made, such as a
+requirement of using pure SQL.  At this time, it is not tested for use in
+Windows.  The author observed that one could separate the concerns of the
+excellently-defined C<Sqitch> workflow from the details of executing the
+changes.  As a result, C<git-sync-world> not only supports controlled schema
+migrations in whatever language the developer desires, it also by extension
+supports simultaneous transactional updates to multiple storage locations, be
+they relational or non-relational databases, flat files, or messaging
+services.  Theoretically, a more targetted schema migration tool could be
+written as a layer on top of the C<git-sync-world> system.
+
+=head1 EXAMPLE PROJECT
+
+Let's build a dirt-simple C<sqlite3> database with schema revision tracking.
+First, we will need a git repository set up with the beginning of
+C<git-sync-world> support:
+
+    $ mkdir tutorial
+    $ cd tutorial
+    $ git init
+    $ mkdir git-sync-world
+
+
+Next, we will need to implement ID-tracking.  To make this bootstrapping
+simple, I am first going to create my sqlite3 database with a silly single-row
+C<revision> table, containing an initial revision of empty string.  Note that
+I could also choose to keep the ID in a file in some shared location, but it
+is generally easier to track dependencies of components that are grouped
+together.  Nevertheless, change tracking is a separate concern from the
+business purpose a schema.
+
+    $ mkdir db
+    $ sqlite3 db/tutorial
+    SQLite version 3.7.14.1 2012-10-04 19:37:12
+    Enter ".help" for instructions
+    Enter SQL statements terminated with a ";"
+    sqlite> create table revision (revision text);
+    sqlite> insert into revision values('');
+    sqlite> .quit
+
+
+Create C<git-sync-world/get-change-id> with this content:
+
+    #!/bin/bash
+    echo "select revision from revision;" | sqlite3 db/tutorial | tail -n 1
+
+
+Create C<git-sync-world/set-change-id> with this content:
+
+    #!/bin/bash
+    echo "insert into revision values('$1');" | sqlite3 db/tutorial
+
+
+Now that we have a way to track and set revision IDs, we can focus on the meat
+of schema migrations.  This schema will be the start of a project to track pet
+adoptions, so we will begin with a companion table.  Let's implement the
+quartet.  First, we implement C<git-sync-world/commit>:
+
+    #!/bin/bash
+    echo "create table companion (id INTEGER PRIMARY KEY, name TEXT);" \
+          | sqlite3 db/tutorial
+
+
+Validate that the table exists in C<git-sync-world/verify-commit>, keeping in mind that
+sqlite3 returns a nonzero exit code when a query fails:
+
+    #!/bin/bash
+    echo "select * from companion;" | sqlite3 db/tutorial > /dev/null 2>&1
+
+
+Implement C<git-sync-world/rollback> to remove the table:
+
+    #!/bin/bash
+    echo "drop table companion;" | sqlite3 db/tutorial
+
+
+And implement C<git-sync-world/verify-rollback> to be the inverse of
+C<verify-commit>:
+
+    #!/bin/bash
+    ! git-sync-world/verify-commit
+
+
+Ensure all six C<git-sync-world> scripts are executable:
+
+    $ chmod +x git-sync-world/*
+
+
+We can handtest these scripts by running them individually in the order they
+would be executed by C<git-sync-world>.  C<git-sync-world> does not run
+against dirty working trees.  To make them ready for prime time, we must
+commit them to git:
+
+    $ git add git-sync-world
+    $ git commit -m 'Create companion table'
+
+
+This will be our first schema change.  You can always check the current status:
+
+    $ git sync-world --status
+    git-sync-world: World ID:
+    git-sync-world: Git ID  : 34ce98e7e77678db31e4f4860e5536578196d3cf
+    git-sync-world: The world will be synced to your git repository.
+
+
+Pull the trigger:
+
+    $ git sync-world
+    git-sync-world: Applied commit at 34ce98e7e77678db31e4f4860e5536578196d3cf
+    git-sync-world: Done.
+
+
+Now let's make a second change.  We want to record the breed of our
+companions.  Since we defined C<verify-rollback> as the inverse of
+C<verify-commit>, we usually do not need to update it.  Alter the other three
+change files, starting with C<git-sync-world/commit>:
+
+    #!/bin/bash
+    echo "alter table companion add column breed TEXT;" \
+         | sqlite3 db/tutorial
+
+
+Then C<git-sync-world/verify-commit>:
+
+    #!/bin/bash
+    echo "select breed from companion;" | sqlite3 db/tutorial > /dev/null 2>&1
+
+
+Finally we implement C<git-sync-world/rollback>; unfortunately, this is complicated with
+sqlite3, since it does not support column dropping:
+
+    #!/bin/bash
+    echo "
+        BEGIN TRANSACTION;
+        CREATE TEMPORARY TABLE companion_backup(id INTEGER, name TEXT);
+        INSERT INTO companion_backup SELECT id, name FROM companion;
+        DROP TABLE companion;
+        CREATE TABLE companion (id INTEGER PRIMARY KEY, name TEXT);
+        INSERT INTO companion SELECT id, name FROM companion_backup;
+        DROP TABLE companion_backup;
+        COMMIT;
+    " | sqlite3 db/tutorial
+
+
+Commit these changes to git, and run C<git-sync-world>.
+
+    $ git sync-world
+    git-sync-world: Applied commit at 4e84d5ddb0b488208e05fd32f662e7bde9097a1f
+    git-sync-world: Done.
+
+
+If all that seems too convenient, you can always exercise some healthy
+skepticism:
+
+    $ echo '.dump companion' | sqlite3 db/tutorial
+    PRAGMA foreign_keys=OFF;
+    BEGIN TRANSACTION;
+    CREATE TABLE companion (id INTEGER PRIMARY KEY, name TEXT, breed TEXT);
+    COMMIT;
+
+
+If something goes wrong in the middle of the tutorial, a direct call to
+C<rollback> and C<git sync-world --abort> usually helps.  As always, before
+applying changes to your production data storage, you should test the changes
+against a staging system.  C<git-sync-world> is paranoid and will not attempt
+to correct problems caused by code within the workflow change scripts, for
+fear of confusing the situation.
+
+=cut
+

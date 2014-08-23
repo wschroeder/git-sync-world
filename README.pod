@@ -1,0 +1,358 @@
+=head1 NAME
+
+git-sync-world - Sync the world to this git checkout
+
+=head1 SYNOPSIS
+
+git sync-world
+
+git sync-world --status
+
+git sync-world [--continue|--skip|--abort]
+
+=head1 DESCRIPTION
+
+Synchronizes the world to this git checkout.
+
+It rolls back changes down the git revision tree and commits changes up the
+git revision tree in the shortest path in order to migrate world changes from
+git version the world uses to the git version checked out.  For example, this
+can be used to perform schema migrations, including rollbacks, updates, and
+testing of feature branches.
+
+At each revision, it looks in the root of the git repository for the
+C<git-sync-world> directory, which must have executable C<get-change-id>,
+C<commit>, C<verify-commit>, C<set-change-id>, C<rollback>, and
+C<verify-rollback> files, representing the stages of the synchronization
+workflow.  See the L</"WORKFLOW"> and L</"CHANGE FILES"> sections for more
+information about these files.
+
+=head1 OPTIONS
+
+=over
+
+=item --abort
+
+Similar to L<"git-rebase"> behavior, if the git repository is in the middle of
+a sync-world operation that experienced a failure, this option will abort
+synchronization and return the git repository to the original checkout.
+
+=item --continue
+
+Similar to L<"git-rebase"> behavior, if the git repository is in the middle of
+a sync-world operation that experienced a failure, this option will continue
+the workflow where it left off, starting with rollback or commit.  Note that
+you will likely be changing the revision ID at this point in order to fix the
+system, so you must also update C<.git/git-sync-world/commit> or
+C<.git/git-sync-world/rollback> to replace the bad revision ID and subsequent
+IDs with the new good branch of revision IDs, likely starting with the current
+HEAD.
+
+=item --help
+
+Show this help.
+
+=item --skip
+
+Similar to L<"git-rebase"> behavior, if the git repository is in the middle of
+a sync-world operation that experienced a failure, this option will skip the
+current revision, checkout the next revision, and continue the workflow where
+it left off, starting with rollback or commit.
+
+=item --status
+
+Show the current status of the world contrasted with the current git checkout.
+
+=back
+
+=head1 WORKFLOW
+
+Assume the following git history exists, the current branch is C<topic>, and
+the change ID in the world matches C<master>:
+
+          A---B---C topic
+         /
+    D---E---F---G master
+
+
+When you run C<git-sync-world>, it will first determine what needs to be done,
+comparing the current HEAD against C<git-sync-world/get-change-id>, which
+should return the C<master> revision in this scenario.
+
+It records the current friendly revision in C<.git/git-sync-world/ORIG_HEAD>
+(C<topic>).  It figures out that in order to reach the C<topic> branch from
+C<master>, it must roll back changes in G, then F, then E; these three
+revisions are recorded in C<.git/git-sync-world/rollback>.  Then it figures
+out that to crawl back up the tree to C<topic>, it must commit changes in A,
+then B, then C; these three revisions are recorded in
+C<.git/git-sync-world/commit>.
+
+It cycles through all the revisions in the C<.git/git-sync-world/rollback>
+file by removing the first entry from the file at each checkout.  It will then
+checkout the revision, call C<git-sync-world/rollback>, call
+C<git-sync-world/verify-rollback>, checkout the prior revision (C<HEAD^>), and
+call C<git-sync-world/set-change-id>.  It repeats this for G, F, and E.
+
+When there are no revisions in C<.git/git-sync-world/rollback>, it cycles
+through all the revisions in the C<.git/git-sync-world/commit> file by
+removing the first entry from the file at each checkout.  It will then
+checkout the revision, call C<git-sync-world/commit>, call
+C<git-sync-world/set-change-id>, and call C<git-sync-world/verify-commit>.  It
+repeats this for A, B, and C.
+
+Finally, it checks out the C<.git/git-sync-world/ORIG_HEAD>, which in this
+scenario was C<topic>.
+
+If the process fails at any point, it will not attempt recovery.  No magic.
+This allows you to debug and correct problems at the exact point of failure.
+
+Note that every step of the process is in a detached HEAD state.  If it
+started with a detached HEAD, it will end with that same revision, detached;
+otherwise, it will checkout the branch appropriately.
+
+
+=head1 CHANGE FILES
+
+For each revision or migration, you must define all six change files.
+Usually, C<get-change-id> and C<set-change-id> only need to be established
+once in the first commit, and C<commit>, C<verify-commit>, C<rollback>, and
+C<verify-rollback> are updated for every new change to the world.  In most
+cases, C<verify-rollback> can be written as the inverse of C<verify-commit>,
+saving you the need to change it at each commit as well.
+
+=over
+
+=item commit
+
+This script applies changes to the world.  For example, you might implement
+C<commit> as a Python script that uses SQLAlchemy to add a column to a table
+in a database.  A nonzero exit status is considered a failure to apply
+changes.
+
+=item get-change-id
+
+This script prints to C<STDOUT> the unique git revision hash.  For example,
+you might implement C<get-change-id> as a Perl script that uses DBI to query a
+table in a database for its schema revision ID and then print it.  An empty
+string (no output) indicates the pre-tracking state; no changes have been
+officially committed to the data source.  It probably only needs to be
+implemented once.  A nonzero exit status is considered a failure to retrieve
+the ID.
+
+=item rollback
+
+This script applies changes to the world that reverse changes made by the
+C<commit> in the same revision.  For example, you might implement C<rollback>
+as a Ruby script that uses Sequel to remove a column from a table in a
+database.  Not all kinds of changes are easy to rollback, such as data
+transforms; this bad situation occurs whenever recorded strings contain more
+than one kind of information, effectively violating First Normal Form.  A
+nonzero exit status is considered a failure to apply changes.
+
+=item set-change-id
+
+This script takes a single argument, a git revision hash, and marks the world
+with this ID.  For example, you might implement C<set-change-id> as
+gcc-compiled binary that sets this value to a table in a database to represent
+the schema revision ID.  It probably only needs to be implemented once.  A
+nonzero exit status is considered a failure to set the ID.
+
+=item verify-commit
+
+This script tests that the recent C<commit> actually made the expected
+changes.  For example, if C<commit> inserted rows into a domain table in a
+database, C<verify-commit> could be a C<sh> script that runs the C<mysql>
+client to perform a query for those rows.  A nonzero exit status indicates
+that the C<commit> failed to pass the tests, and a zero exit status indicates
+a pass.
+
+=item verify-rollback
+
+This script tests that the recent C<rollback> actually made the expected
+changes that revert what was done by the C<commit> in the same revision.  For
+example, if C<commit> inserted rows into a domain table in a database and
+C<rollback> removed those rows, C<verify-rollback> could be a C<bash> script
+that runs C<sqlplus> to perform a query that shows that those rows no longer
+exist.  It probably only needs to be implemented once as the inverse of the
+result of a call to C<verify-commit>, but some kinds of changes need extra
+checking.  A nonzero exit status indicates that the C<rollback> failed to pass
+the tests, and a zero exit status indicates a pass.
+
+=back
+
+=head1 MOTIVATION
+
+C<git-sync-world> was inspired by C<Sqitch> by theory (sqitch.org).  At the
+time of writing, it differs in that it adds a verify phase for rollbacks, uses
+git revisions for change tracking rather than a database of dependencies, and
+has fewer opinions in terms of how changes should be made, such as a
+requirement of using pure SQL.  At this time, it is not tested for use in
+Windows.  The author observed that one could separate the concerns of the
+excellently-defined C<Sqitch> workflow from the details of executing the
+changes.  As a result, C<git-sync-world> not only supports controlled schema
+migrations in whatever language the developer desires, it also by extension
+supports simultaneous transactional updates to multiple storage locations, be
+they relational or non-relational databases, flat files, or messaging
+services.  Theoretically, a more targetted schema migration tool could be
+written as a layer on top of the C<git-sync-world> system.
+
+=head1 EXAMPLE PROJECT
+
+Let's build a dirt-simple C<sqlite3> database with schema revision tracking.
+First, we will need a git repository set up with the beginning of
+C<git-sync-world> support:
+
+    $ mkdir tutorial
+    $ cd tutorial
+    $ git init
+    $ mkdir git-sync-world
+
+
+Next, we will need to implement ID-tracking.  To make this bootstrapping
+simple, I am first going to create my sqlite3 database with a silly single-row
+C<revision> table, containing an initial revision of empty string.  Note that
+I could also choose to keep the ID in a file in some shared location, but it
+is generally easier to track dependencies of components that are grouped
+together.  Nevertheless, change tracking is a separate concern from the
+business purpose a schema.
+
+    $ mkdir db
+    $ sqlite3 db/tutorial
+    SQLite version 3.7.14.1 2012-10-04 19:37:12
+    Enter ".help" for instructions
+    Enter SQL statements terminated with a ";"
+    sqlite> create table revision (revision text);
+    sqlite> insert into revision values('');
+    sqlite> .quit
+
+
+Create C<git-sync-world/get-change-id> with this content:
+
+    #!/bin/bash
+    echo "select revision from revision;" | sqlite3 db/tutorial | tail -n 1
+
+
+Create C<git-sync-world/set-change-id> with this content:
+
+    #!/bin/bash
+    echo "insert into revision values('$1');" | sqlite3 db/tutorial
+
+
+Now that we have a way to track and set revision IDs, we can focus on the meat
+of schema migrations.  This schema will be the start of a project to track pet
+adoptions, so we will begin with a companion table.  Let's implement the
+quartet.  First, we implement C<git-sync-world/commit>:
+
+    #!/bin/bash
+    echo "create table companion (id INTEGER PRIMARY KEY, name TEXT);" \
+          | sqlite3 db/tutorial
+
+
+Validate that the table exists in C<git-sync-world/verify-commit>, keeping in mind that
+sqlite3 returns a nonzero exit code when a query fails:
+
+    #!/bin/bash
+    echo "select * from companion;" | sqlite3 db/tutorial > /dev/null 2>&1
+
+
+Implement C<git-sync-world/rollback> to remove the table:
+
+    #!/bin/bash
+    echo "drop table companion;" | sqlite3 db/tutorial
+
+
+And implement C<git-sync-world/verify-rollback> to be the inverse of
+C<verify-commit>:
+
+    #!/bin/bash
+    ! git-sync-world/verify-commit
+
+
+Ensure all six C<git-sync-world> scripts are executable:
+
+    $ chmod +x git-sync-world/*
+
+
+We can handtest these scripts by running them individually in the order they
+would be executed by C<git-sync-world>.  C<git-sync-world> does not run
+against dirty working trees.  To make them ready for prime time, we must
+commit them to git:
+
+    $ git add git-sync-world
+    $ git commit -m 'Create companion table'
+
+
+This will be our first schema change.  You can always check the current status:
+
+    $ git sync-world --status
+    git-sync-world: World ID:
+    git-sync-world: Git ID  : 34ce98e7e77678db31e4f4860e5536578196d3cf
+    git-sync-world: The world will be synced to your git repository.
+
+
+Pull the trigger:
+
+    $ git sync-world
+    git-sync-world: Applied commit at 34ce98e7e77678db31e4f4860e5536578196d3cf
+    git-sync-world: Done.
+
+
+Now let's make a second change.  We want to record the breed of our
+companions.  Since we defined C<verify-rollback> as the inverse of
+C<verify-commit>, we usually do not need to update it.  Alter the other three
+change files, starting with C<git-sync-world/commit>:
+
+    #!/bin/bash
+    echo "alter table companion add column breed TEXT;" \
+         | sqlite3 db/tutorial
+
+
+Then C<git-sync-world/verify-commit>:
+
+    #!/bin/bash
+    echo "select breed from companion;" | sqlite3 db/tutorial > /dev/null 2>&1
+
+
+Finally we implement C<git-sync-world/rollback>; unfortunately, this is complicated with
+sqlite3, since it does not support column dropping:
+
+    #!/bin/bash
+    echo "
+        BEGIN TRANSACTION;
+        CREATE TEMPORARY TABLE companion_backup(id INTEGER, name TEXT);
+        INSERT INTO companion_backup SELECT id, name FROM companion;
+        DROP TABLE companion;
+        CREATE TABLE companion (id INTEGER PRIMARY KEY, name TEXT);
+        INSERT INTO companion SELECT id, name FROM companion_backup;
+        DROP TABLE companion_backup;
+        COMMIT;
+    " | sqlite3 db/tutorial
+
+
+Commit these changes to git, and run C<git-sync-world>.
+
+    $ git sync-world
+    git-sync-world: Applied commit at 4e84d5ddb0b488208e05fd32f662e7bde9097a1f
+    git-sync-world: Done.
+
+
+If all that seems too convenient, you can always exercise some healthy
+skepticism:
+
+    $ echo '.dump companion' | sqlite3 db/tutorial
+    PRAGMA foreign_keys=OFF;
+    BEGIN TRANSACTION;
+    CREATE TABLE companion (id INTEGER PRIMARY KEY, name TEXT, breed TEXT);
+    COMMIT;
+
+
+If something goes wrong in the middle of the tutorial, a direct call to
+C<rollback> and C<git sync-world --abort> usually helps.  As always, before
+applying changes to your production data storage, you should test the changes
+against a staging system.  C<git-sync-world> is paranoid and will not attempt
+to correct problems caused by code within the workflow change scripts, for
+fear of confusing the situation.
+
+
+=cut
+
