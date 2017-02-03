@@ -61,13 +61,23 @@ sub get_root_git_dir {
     return $root_dir;
 }
 
+sub get_git_dir {
+    my $git_dir = `git rev-parse --git-dir`;
+    if (!defined($git_dir) || $git_dir eq '') {
+        fatal_error('Cannot find the git directory from here');
+    }
+    chomp($git_dir);
+    return $git_dir;
+}
+
 sub get_configuration {
     my $root_dir  = get_root_git_dir();
+    my $git_dir   = get_git_dir();
     my $user_home = "$root_dir/git-sync-world";
     check_for_dirty_working_tree();
     return (
         user_home => $user_home,
-        sync_home => "$root_dir/.git/git-sync-world",
+        sync_home => "$git_dir/git-sync-world",
         world_id  => get_current_world_change_id($user_home),
         local_id  => get_current_git_id(),
     );
