@@ -84,6 +84,7 @@ sub get_configuration {
 }
 
 sub check_for_dirty_working_tree {
+    `git status 2>&1`;
     if (system(qw(git diff-index --quiet HEAD --))) {
         fatal_error("Cannot run in a git repo with a dirty working tree.\nIf you are trying to test, you probably should not modify the world anyway.");
     }
